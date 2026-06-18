@@ -1,0 +1,70 @@
+---
+title: "GreyVsRed"
+output: html_document
+---
+
+```{r, include=FALSE}
+library(tidyverse)
+library(giscoR)
+library(sf)
+
+red_raw <- read.csv("records-2026-06-16/records-2026-06-16.csv")
+grey_raw <- read.csv("records-2026-06-16-Sciurus-carolinensis/records-2026-06-16-Sciurus-carolinensis.csv")
+```
+
+```{r, include=FALSE}
+red2020 <- red_raw |> 
+  filter(Year == 2020) |> 
+  rename(Longitude = Longitude..WGS84., Latitude = Latitude..WGS84.)
+grey2020 <- grey_raw |> 
+  filter(Year == 2020) |> 
+  rename(Longitude = Longitude..WGS84., Latitude = Latitude..WGS84.)
+uk <- gisco_get_countries(country="UK")
+
+# 1. Project the UK layer
+uk_projected <- st_transform(uk, 27700)
+
+# 2. Get the bounding box area of the UK
+bbox <- st_bbox(uk_projected)
+bbox_area <- (bbox$xmax - bbox$xmin) * (bbox$ymax - bbox$ymin)
+
+# 3. Calculate the target size for ~100 hexagons
+# The area of a regular hexagon is approximately 0.866 * d^2 (where d is cellsize diameter)
+target_hex_area <- bbox_area / 1000 # We aim for ~120 to account for ocean cut-offs
+hex_cellsize <- sqrt(target_hex_area / 0.866)
+
+# 4. Create the hex grid
+hex_grid <- st_make_grid(uk_projected, cellsize = hex_cellsize, square = FALSE) %>%
+  st_sf() %>%
+  mutate(region_id = row_number())
+
+# 5. Clip it cleanly to the UK coastline
+uk_hex_grid <- st_intersection(hex_grid, st_union(uk_projected))
+
+# 1. Project your points
+points_sf <- st_as_sf(red2020, coords = c("Longitude", "Latitude"), crs = 4326) %>%
+  st_transform(27700)
+
+# 2. Spatial Join
+points_in_hex <- st_join(points_sf, uk_hex_grid, join = st_intersects)
+
+# 3. Count points per hexagon
+hex_counts <- points_in_hex %>%
+  st_drop_geometry() %>%
+  group_by(region_id) %>%
+  summarise(point_count = n())
+
+# 4. Join counts back to the hexagonal map shapes
+uk_density_hex <- uk_hex_grid %>%
+  left_join(hex_counts, by = "region_id") %>%
+  mutate(point_count = replace_na(point_count, 0))
+
+ggplot() +
+  geom_sf(data=uk_density_hex, aes(alpha = point_count), color = "white", size = 0.1) +
+  theme_minimal() +
+  theme(axis.text.x=element_blank(), 
+        axis.title.x=element_blank(),
+        axis.text.y=element_blank(), 
+        axis.title.y=element_blank(),
+        panel.grid.major = element_blank())
+```
