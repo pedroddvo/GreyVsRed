@@ -7,6 +7,7 @@ output: html_document
 library(tidyverse)
 library(giscoR)
 library(sf)
+library(broom)
 
 red <- read.csv("records-2026-06-16/records-2026-06-16.csv") |> 
   rename(Longitude = Longitude..WGS84., Latitude = Latitude..WGS84.)
@@ -37,13 +38,13 @@ hex_grid <- st_make_grid(uk_projected, cellsize = hex_cellsize, square = FALSE) 
 # 5. Clip it cleanly to the UK coastline
 uk_hex_grid <- st_intersection(hex_grid, st_union(uk_projected))
 
-create_density <- function(points) {
+create_density <- function(points, sfc) {
   # 1. Project your points
   points_sf <- st_as_sf(points, coords = c("Longitude", "Latitude"), crs = 4326) %>%
     st_transform(27700)
   
   # 2. Spatial Join
-  points_in_hex <- st_join(points_sf, uk_hex_grid, join = st_intersects)
+  points_in_hex <- st_join(points_sf, sfc, join = st_intersects)
   
   # 3. Count points per hexagon
   hex_counts <- points_in_hex %>%
@@ -52,7 +53,7 @@ create_density <- function(points) {
     summarise(point_count = n())
   
   # 4. Join counts back to the hexagonal map shapes
-  uk_hex_grid %>%
+  sfc %>%
     left_join(hex_counts, by = "region_id") %>%
     mutate(point_count = replace_na(point_count, 0))
 }
@@ -61,8 +62,8 @@ create_density <- function(points) {
 ```{r, echo=FALSE}
 graph_uk_density <- function(year) {
   combined_density <- bind_rows(
-    mutate(create_density(red |> filter(Year==year)), Squirrel = "Red Squirrels"),
-    mutate(create_density(grey |> filter(Year==year)), Squirrel = "Grey Squirrels")
+    mutate(create_density(red |> filter(Year==year), uk_hex_grid), Squirrel = "Red Squirrels"),
+    mutate(create_density(grey |> filter(Year==year), uk_hex_grid), Squirrel = "Grey Squirrels")
   )
   
   ggplot() +
@@ -93,20 +94,92 @@ sightings <- bind_rows(
   mutate(Total = Red + Grey, Prop = Red / Total) |>
   filter(Total > 50)
 
+fit <- glm(Prop ~ Year, weight=Total, data=sightings, family=binomial)
+
 ggplot(sightings, aes(x = Year, y = Prop)) +
+  geom_smooth(method="glm", method.args = list(family = "binomial"), 
+              aes(weight = Total), se = TRUE) +
   geom_line() +
   geom_point(size = 1) +
   scale_y_continuous(labels = scales::label_percent(), limits = c(0, NA)) +
   theme_minimal() +
   labs(
     title = "The Decline of the Red Squirrel Share in the UK",
-    subtitle = "Proportion of total annual squirrel sightings that were Red",
+    subtitle = "Proportion of total annual squirrel sightings that were Red\nCurve fitted using a binomial GLM (weighted by annual sample size)",
     y = "Share of Total Sightings",
     x = "Year"
   )
 ```
 
+```{r, echo=FALSE}
+nuts <- gisco_get_nuts(country="UK", nuts_level = "3", year=2016) %>%
+  st_transform(27700) %>%
+  mutate(region_id = row_number())
+
+yearA <- 1990
+yearB <- 2026
+
+nuts_density <- bind_rows(
+  mutate(red %>% filter(Year >= yearA) %>% group_by(Year) %>% group_modify(~ create_density(.x, nuts)), Squirrel="Red"),
+  mutate(grey %>% filter(Year >= yearA) %>% group_by(Year) %>% group_modify(~ create_density(.x, nuts)), Squirrel="Grey"),
+) %>%
+  pivot_wider(names_from = Squirrel, values_from = point_count) %>%
+  mutate(Total = Red + Grey, Prop = Red / Total) %>% 
+  filter(Total > 50)
+
+nuts_density_models <- nuts_density %>%
+  group_by(NUTS_NAME) %>%
+  filter(sum(Red > 0) >= 3) %>% # Eliminate extinction possibility
+  summarise(fit = list(glm(Prop ~ Year, weight=Total, family=binomial, data=pick(everything()))))
+
+change_in_prop <- nuts_density_models %>% 
+  rowwise() %>% 
+  mutate(pA = predict(fit, newdata=data.frame(Year=yearA), type="response"), 
+         pB = predict(fit, newdata=data.frame(Year=yearB), type="response"), 
+         Change = pB - pA)
+
+library(ggpattern)
+
+ggplot() + 
+  geom_sf(data=nuts, colour="gray70") +
+  geom_sf(data=left_join(nuts, change_in_prop, by="NUTS_NAME"), aes(fill = Change)) +
+  scale_fill_distiller(palette = "RdBu", direction = -1, limits = c(-1, 1), oob = scales::squish, labels = scales::label_percent()) +
+  theme_minimal() +
+  labs(title = sprintf("Red Squirrel Displacement Across the UK (%d-%d)", yearA, yearB),
+       subtitle = "Modeled absolute change in the Red Squirrel share of total sightings",
+       caption = paste("Negative (blue) values indicate Red displacement by Grey squirrels.\n", gisco_attributions()),
+       fill = "Net Shift in\nPopulation Share") +
+  theme(axis.text.x=element_blank(), 
+        axis.title.x=element_blank(),
+        axis.text.y=element_blank(), 
+        axis.title.y=element_blank(),
+        panel.grid.major = element_blank(),
+        plot.caption.position = 'plot',
+        plot.title.position = 'plot',
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+```{r, echo=FALSE}
+extinct <- nuts_density %>%
+  st_drop_geometry() %>%
+  group_by(NUTS_ID, NUTS_NAME) %>%
+  filter(Year >= 1990 & sum(Red > 0) <= 3) %>%
+  ungroup() %>%
+  distinct(NUTS_ID, NUTS_NAME)
+
+extinct_map_data <- nuts %>%
+  left_join(extinct, by = c("NUTS_ID", "NUTS_NAME")) %>%
+  mutate(Status = ifelse(NUTS_ID %in% extinct$NUTS_ID, "Functionally Extinct", "Active/Present"))
+
+ggplot(data = extinct_map_data) + 
+  geom_sf(aes(fill = Status), color = "white", size = 0.1) +
+  scale_fill_manual(values = c("Functionally Extinct" = "grey80", "Active/Present" = "darkred")) +
+  theme_minimal() +
+  labs(title = "Red Squirrel Functional Extinction Zones (1990-2026)")
+```
+
 ```{r, include=FALSE}
-model <- glm(Red ~ Year + offset(log(Total)), data=sightings, family=poisson)
-summary(model)
+library(rnaturalearth)
+library(rnaturalearthdata)
 ```
