@@ -182,4 +182,46 @@ ggplot(data = extinct_map_data) +
 ```{r, include=FALSE}
 library(rnaturalearth)
 library(rnaturalearthdata)
+library(spatialRF)
+library(parallel)
+library(tidyterra)
+library(geodata)
+library(terra)
+
+cluster <- parallel::makeCluster(
+  parallel::detectCores() - 1,
+  type = "PSOCK"
+)
+
+#Marvin N. Wright, Andreas Ziegler (2017). ranger: A Fast Implementation of Random Forests for High Dimensional Data in C++ and R. Journal of Statistical Software, 77(1), 1-17. doi:10.18637/jss.v077.i01
+#Blas M. Benito (2025). spatialRF: Easy Spatial Regression with Random Forest. R package version 1.1.5. doi: 10.5281/zenodo.17992636. url: https://blasbenito.github.io/spatialRF/
+
+# Marston, C.; Rowland, C.S.; O'Neil, A.W.; Morton, R.D. (2022). Land Cover Map 2021 (1km summary rasters, GB and N. Ireland). NERC EDS Environmental Information Data Centre. https://doi.org/10.5285/a3ff9411-3a7a-47e1-9b3e-79f21648237d
+uk_land_cover <- terra::rast("land_cover_data/gb2021lcm1km_dominant_aggregate.tif")
+
+# Carnell, E.; Tomlinson, S.J.; Reis, S. (2025). UK gridded population at 1 km resolution for 2021 based on Census 2021/2022 and Land Cover Map 2021. NERC EDS Environmental Information Data Centre. https://doi.org/10.5285/7beefde9-c520-4ddf-897a-0167e8918595
+uk_population <- terra::rast("population_data/uk_residential_population_2021.tif")
+
+# Jarvis A., H.I. Reuter, A. Nelson, E. Guevara, 2008, Hole-filled seamless SRTM data V4, International Centre for Tropical Agriculture (CIAT), available from https://srtm.csi.cgiar.org.
+uk_elevation <- geodata::elevation_30s("gb", path = tempdir())
+
+forest_features <- terra::extract(uk_land_cover, vect(nuts), fun = function(x) {
+  total <- length(x)
+  pct_coniferous <- sum(x == 2) / total
+  pct_broadleaf  <- sum(x == 1) / total
+  return(c(pct_conif = pct_coniferous, pct_broad = pct_broadleaf))
+})
+
+population_features <- terra::extract(uk_population, vect(nuts), fun = function(x) { return(sum(x, na.rm = TRUE)) })
+
+elevation_features <- terra::extract(uk_elevation, vect(nuts), fun = function(x) { return(mean(x, na.rm = TRUE)) })
 ```
+
+```{r, include=FALSE}
+nuts_density %>% 
+  select(Year, Red, region_id) %>% 
+  left_join(elevation_features, by = c("region_id" = "ID")) %>%
+  left_join(population_features, by = c("region_id" = "ID")) %>%
+  left_join(forest_features, by = c("region_id" = "ID"), copy=TRUE)
+```
+
