@@ -211,17 +211,155 @@ forest_features <- terra::extract(uk_land_cover, vect(nuts), fun = function(x) {
   pct_broadleaf  <- sum(x == 1) / total
   return(c(pct_conif = pct_coniferous, pct_broad = pct_broadleaf))
 })
+colnames(forest_features) <- c("ID", "pct_coniferous", "pct_broadleaf")
 
 population_features <- terra::extract(uk_population, vect(nuts), fun = function(x) { return(sum(x, na.rm = TRUE)) })
+colnames(population_features) <- c("ID", "population")
 
 elevation_features <- terra::extract(uk_elevation, vect(nuts), fun = function(x) { return(mean(x, na.rm = TRUE)) })
+colnames(elevation_features) <- c("ID", "elevation")
 ```
+
+# ```{r, include=FALSE}
+# nuts_df <- nuts_density %>% 
+#   ungroup() %>%
+#   filter(Red > 0) %>%
+#   select(Year, Prop, region_id) %>% 
+#   filter(Year >= 2020) %>%
+#   distinct(region_id, .keep_all = TRUE) %>%
+#   select(-Year)
+# 
+# nuts_centroid <- st_coordinates(st_centroid(nuts)) %>%
+#   as.data.frame() %>%
+#   mutate(ID = row_number()) %>%
+#   filter(ID %in% nuts_df$region_id)
+# 
+# nuts_df <- nuts_df %>%
+#   left_join(elevation_features, by = c("region_id" = "ID")) %>%
+#   left_join(population_features, by = c("region_id" = "ID")) %>%
+#   left_join(forest_features, by = c("region_id" = "ID"), copy=TRUE) %>% 
+#   left_join(nuts_centroid, by = c("region_id" = "ID"), copy=TRUE)
+# 
+# nuts2020 <- filter(nuts, region_id %in% nuts_df$region_id)
+# nuts_distance <- st_distance(st_centroid(nuts2020)) %>% 
+#   unclass()
+# 
+# nuts_coords <- nuts_df[, c("X", "Y")]
+# nuts_dependent <- c("Prop")
+# nuts_predictor <- c("elevation", "population", "pct_coniferous", "pct_broadleaf")
+# distance_thresholds <- c(50000, 100000, 200000)
+# ```
+# 
+# ```{r, include=FALSE}
+# spatialRF::plot_training_df(
+#   data = nuts_df,
+#   dependent.variable.name = nuts_dependent,
+#   predictor.variable.names = nuts_predictor,
+# )
+# ```
+# 
+# ```{r, include=FALSE}
+# spatialRF::plot_training_df_moran(
+#   data = nuts_df,
+#   dependent.variable.name = nuts_dependent,
+#   predictor.variable.names = nuts_predictor,
+#   distance.matrix = nuts_distance,
+#   distance.thresholds = distance_thresholds
+# )
+# ```
+# 
+# ```{r, include=FALSE}
+# nuts_m <- spatialRF::rf(
+#   data = nuts_df,
+#   dependent.variable.name = nuts_dependent,
+#   predictor.variable.names = nuts_predictor,
+#   distance.matrix = nuts_distance,
+#   distance.thresholds = distance_thresholds,
+#   verbose = FALSE
+# )
+# 
+# nuts_m
+# ```
 
 ```{r, include=FALSE}
-nuts_density %>% 
-  select(Year, Red, region_id) %>% 
-  left_join(elevation_features, by = c("region_id" = "ID")) %>%
-  left_join(population_features, by = c("region_id" = "ID")) %>%
-  left_join(forest_features, by = c("region_id" = "ID"), copy=TRUE)
+red_points <- red %>% filter(Year == 2020) %>% select(Longitude, Latitude) %>%
+  st_as_sf(coords=c("Longitude", "Latitude"), crs=4326) %>%
+  st_transform(crs = 27700)
+
+uk_grid <- st_make_grid(red_points, cellsize = 10000, square = TRUE) %>%
+  st_as_sf() %>%
+  mutate(ID = row_number())
+
+uk_grid$red_density <- st_intersects(uk_grid, red_points) %>% 
+  lengths()
+
+red_regions <- red_points %>%
+  st_buffer(dist=1000)
+
+forest_features <- terra::extract(uk_land_cover, vect(uk_grid), fun = function(x) {
+  total <- length(x)
+  pct_coniferous <- sum(x == 2) / total
+  pct_broadleaf  <- sum(x == 1) / total
+  return(c(pct_conif = pct_coniferous, pct_broad = pct_broadleaf))
+}) %>%
+  na.omit() %>%
+  as.data.frame()
+colnames(forest_features) <- c("ID", "pct_coniferous", "pct_broadleaf")
+
+population_features <- terra::extract(uk_population, vect(uk_grid), fun = function(x) { return(sum(x, na.rm = TRUE)) }) %>%
+  na.omit() %>%
+  as.data.frame()
+colnames(population_features) <- c("ID", "population")
+
+elevation_features <- terra::extract(uk_elevation, vect(uk_grid), fun = function(x) { return(mean(x, na.rm = TRUE)) }) %>%
+  na.omit() %>%
+  as.data.frame()
+colnames(elevation_features) <- c("ID", "elevation")
+
+grid_centroids <- st_coordinates(st_centroid(uk_grid)) %>%
+  as.data.frame() %>%
+  mutate(ID = row_number())
+
+points_df <- list(st_drop_geometry(uk_grid), forest_features, population_features, elevation_features, grid_centroids) %>%
+  reduce(inner_join, by = "ID")
+
+points_distance <- st_distance(st_centroid(filter(uk_grid, ID %in% points_df$ID))) %>% 
+  unclass()
+
+presence_df <- points_df %>% mutate(log_density = log1p(red_density)) %>% select(-red_density)
+distance_thresholds <- c(10000, 40000, 100000, 400000)
 ```
 
+
+```{r, include=FALSE, cache=TRUE}
+points_predictor <- c("pct_coniferous", "pct_broadleaf", "population", "elevation")
+spatialRF::plot_training_df(
+  data = presence_df,
+  dependent.variable.name = c("log_density"),
+  predictor.variable.names = points_predictor,
+)
+```
+
+```{r, include=FALSE, cache=TRUE}
+spatialRF::plot_training_df_moran(
+  data = presence_df,
+  dependent.variable.name = c("log_density"),
+  predictor.variable.names = points_predictor,
+  distance.matrix = points_distance,
+  distance.thresholds = distance_thresholds
+)
+```
+
+```{r, include=FALSE, cache=TRUE}
+presence_m <- spatialRF::rf_spatial(
+  data = presence_df,
+  dependent.variable.name = c("log_density"),
+  predictor.variable.names = points_predictor,
+  distance.matrix = points_distance,
+  distance.thresholds = distance_thresholds,
+  max.spatial.predictors = 50,
+  verbose = TRUE
+)
+
+presence_m
+```
